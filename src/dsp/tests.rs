@@ -1131,6 +1131,53 @@ fn chunked_processing_matches_one_block() {
 // ---------------------------------------------------------------------------------
 
 #[test]
+fn flush_denormals_zeroes_exactly_the_subnormals() {
+    let smallest = f32::from_bits(1);
+    let largest_subnormal = f32::from_bits(0x007f_ffff);
+    let cases: [(f32, f32); 14] = [
+        (smallest, 0.0),
+        (-smallest, -0.0),
+        (largest_subnormal, 0.0),
+        (-largest_subnormal, -0.0),
+        (f32::MIN_POSITIVE / 3.0, 0.0),
+        (f32::MIN_POSITIVE, f32::MIN_POSITIVE),
+        (-f32::MIN_POSITIVE, -f32::MIN_POSITIVE),
+        (0.0, 0.0),
+        (-0.0, -0.0),
+        (1e-30, 1e-30),
+        (-0.5, -0.5),
+        (f32::MAX, f32::MAX),
+        (f32::INFINITY, f32::INFINITY),
+        (f32::NEG_INFINITY, f32::NEG_INFINITY),
+    ];
+    // Odd length, so a vectorized loop's scalar tail is exercised too.
+    let mut buf: Vec<f32> = cases.iter().map(|&(x, _)| x).chain([f32::NAN]).collect();
+    flush_denormals(&mut buf);
+    for (&(x, expected), &y) in cases.iter().zip(&buf) {
+        assert_eq!(y.to_bits(), expected.to_bits(), "{x:e} → {y:e}");
+    }
+    assert!(buf[cases.len()].is_nan());
+    flush_denormals(&mut []);
+
+    // Random bit patterns: subnormal ⇔ changed, and changed only to a signed zero.
+    let mut rng = Rng::new(11);
+    let mut v: Vec<f32> = (0..4_099)
+        .map(|_| f32::from_bits(rng.next_u64() as u32 >> (rng.below(2) * 8)))
+        .collect();
+    let before = v.clone();
+    flush_denormals(&mut v);
+    for (a, b) in before.iter().zip(&v) {
+        if a.is_subnormal() {
+            assert_eq!(*b, 0.0);
+            assert_eq!(b.is_sign_negative(), a.is_sign_negative());
+        } else {
+            assert_eq!(a.to_bits(), b.to_bits());
+        }
+    }
+    assert!(before.iter().any(|a| a.is_subnormal()));
+}
+
+#[test]
 fn silence_after_impulse_flushes_to_exact_zero() {
     for &fs in &TEST_RATES {
         for variant in 0..2 {

@@ -40,6 +40,31 @@ pub const DECLICK_RAMP_MS: f64 = 15.0;
 const FALLBACK_SAMPLE_RATE: f64 = 48_000.0;
 const MIN_SAMPLE_RATE: f64 = 1_000.0;
 
+/// Replace every subnormal sample in `buf` with a zero of the same sign. All other values
+/// (normal numbers, ±0, ±inf, NaN) are left bit-exact.
+///
+/// Uses only integer operations on the bit pattern, so it never does floating-point
+/// arithmetic on a subnormal itself (which takes a slow microcode path on many x86 CPUs
+/// unless FTZ/DAZ are set, and nice-plug leaves them unset), and the loop vectorizes. The
+/// plugin runs it on its input before any arithmetic and on its output, so subnormal
+/// input (e.g. an upstream reverb tail decaying to silence) costs nothing downstream and
+/// the host never receives subnormals. Realtime-safe.
+#[inline]
+pub fn flush_denormals(buf: &mut [f32]) {
+    const EXPONENT_BITS: u32 = 0x7f80_0000;
+    const SIGN_BIT: u32 = 0x8000_0000;
+    for x in buf {
+        let bits = x.to_bits();
+        // Zero exponent: ±0 (unchanged by this) or subnormal (becomes ±0).
+        let flushed = if bits & EXPONENT_BITS == 0 {
+            bits & SIGN_BIT
+        } else {
+            bits
+        };
+        *x = f32::from_bits(flushed);
+    }
+}
+
 /// High-pass slope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum HpfSlope {
@@ -157,7 +182,8 @@ impl Default for EqSettings {
 ///   state is < 1e-12 (−240 dBFS), then drops it: no step when a gain is smoothed to
 ///   0 dB, and bit-exact pass-through a few filter time constants later.
 /// - **Denormals**: state below 1e-20 is flushed to zero once per segment (see
-///   [`biquad::BiquadState::flush_denormals`]).
+///   [`biquad::BiquadState::flush_denormals`]). Subnormal *input* samples are passed
+///   through unchanged; the plugin layer removes them with [`flush_denormals`] first.
 pub struct EqChain {
     sample_rate: f64,
     settings: EqSettings,
