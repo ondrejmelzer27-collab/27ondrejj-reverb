@@ -1,0 +1,33 @@
+[package]
+name = "vocal_eq"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "Vocal EQ: high-pass, low shelf, mid peak and high shelf with a spectrum analyzer"
+publish = false
+
+[workspace]
+members = ["xtask"]
+
+[lib]
+# cdylib for the plugin bundles, lib so integration tests/tools can link the crate.
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+# `assert_process_allocs` only takes effect with debug assertions enabled: in debug
+# builds any allocation inside process() aborts with a backtrace; release builds are
+# unaffected.
+nice-plug = { version = "0.4.2", features = ["assert_process_allocs"] }
+nice-plug-egui = "0.6.0"
+egui = { version = "0.37", features = ["default_fonts"] }
+rtrb = "0.4.1"
+realfft = "3.5"
+
+[profile.release]
+lto = "thin"
+strip = "symbols"
+
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = "none"
