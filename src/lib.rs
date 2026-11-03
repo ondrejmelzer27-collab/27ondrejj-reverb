@@ -1,4 +1,8 @@
 //! vocal_eq — CLAP + VST3 vocal EQ built on nice-plug.
+//!
+//! Signal flow: input → [`dsp::EqChain`] (HPF → low shelf → mid peak → high shelf) →
+//! output gain → output. The processed output is also pushed (mono) to the
+//! [`analyzer_bus`] for the editor's spectrum analyzer.
 
 use std::sync::Arc;
 
@@ -12,10 +16,13 @@ pub mod editor;
 pub mod params;
 
 use analyzer_bus::{AnalyzerProducer, AnalyzerReceiver, analyzer_bus};
+use dsp::{EqChain, SUB_BLOCK_SIZE};
 use params::VocalEqParams;
 
 pub struct VocalEq {
     params: Arc<VocalEqParams>,
+    /// Audio-thread EQ. Recreated (allocation-free, plain struct) in `activate()`.
+    chain: EqChain,
     analyzer_tx: AnalyzerProducer,
     analyzer_rx: AnalyzerReceiver,
     repaint: RepaintNotifier,
@@ -23,12 +30,63 @@ pub struct VocalEq {
 
 impl Default for VocalEq {
     fn default() -> Self {
+        let params = Arc::new(VocalEqParams::default());
+        let mut chain = EqChain::new(48_000.0);
+        chain.set_params_immediate(&params.target_eq_settings());
+        // The analyzer ring is allocated here, once, never on the audio thread.
         let (analyzer_tx, analyzer_rx) = analyzer_bus();
         Self {
-            params: Arc::new(VocalEqParams::default()),
+            params,
+            chain,
             analyzer_tx,
             analyzer_rx,
             repaint: RepaintNotifier::new(),
+        }
+    }
+}
+
+impl VocalEq {
+    /// Run the EQ over one stereo block. While any EQ smoother is active the block is
+    /// split into [`SUB_BLOCK_SIZE`] sub-blocks and the chain gets new settings per
+    /// sub-block; otherwise the (unchanged) targets are handed over once and the chain
+    /// recomputes nothing unless a discrete param (bypass/slope) changed.
+    fn process_eq(&mut self, left: &mut [f32], right: &mut [f32]) {
+        let num_samples = left.len().min(right.len());
+        if self.params.eq_is_smoothing() {
+            let mut start = 0;
+            while start < num_samples {
+                let end = (start + SUB_BLOCK_SIZE).min(num_samples);
+                let settings = self.params.next_eq_settings((end - start) as u32);
+                self.chain.set_params(&settings);
+                self.chain
+                    .process_stereo(&mut left[start..end], &mut right[start..end]);
+                start = end;
+            }
+        } else {
+            self.chain.set_params(&self.params.target_eq_settings());
+            self.chain
+                .process_stereo(&mut left[..num_samples], &mut right[..num_samples]);
+        }
+    }
+
+    /// Apply the smoothed output gain. Unity gain with no smoothing is skipped so the
+    /// default state stays bit-exact transparent.
+    fn process_output_gain(&self, left: &mut [f32], right: &mut [f32]) {
+        let smoother = &self.params.output_gain.smoothed;
+        if smoother.is_smoothing() {
+            for (l, r) in left.iter_mut().zip(right.iter_mut()) {
+                let gain = smoother.next();
+                *l *= gain;
+                *r *= gain;
+            }
+        } else {
+            let gain = smoother.next();
+            if gain != 1.0 {
+                for (l, r) in left.iter_mut().zip(right.iter_mut()) {
+                    *l *= gain;
+                    *r *= gain;
+                }
+            }
         }
     }
 }
@@ -68,11 +126,19 @@ impl Plugin for VocalEq {
         buffer_config: &BufferConfig,
         _context: &mut impl ActivateContext<Self>,
     ) -> bool {
+        // Not on the audio thread: safe to (re)build state here. The wrapper has already
+        // snapped every smoother to its target, so start the chain at the targets too.
+        self.chain = EqChain::new(buffer_config.sample_rate as f64);
+        self.chain
+            .set_params_immediate(&self.params.target_eq_settings());
         self.analyzer_tx.set_sample_rate(buffer_config.sample_rate);
         true
     }
 
-    fn reset(&mut self) {}
+    fn reset(&mut self) {
+        // May be called on the audio thread: only clears filter state, no allocation.
+        self.chain.reset();
+    }
 
     fn process(
         &mut self,
@@ -80,13 +146,19 @@ impl Plugin for VocalEq {
         _aux: &mut AuxiliaryBuffers,
         _context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
-        // Phase 1 scaffold: output gain only. The EQ chain is wired in during integration.
-        for mut frame in buffer.iter_samples() {
-            let gain = self.params.output_gain.smoothed.next();
-            for sample in frame.iter_mut() {
-                *sample *= gain;
-            }
+        let [left, right] = buffer.as_slice() else {
+            return ProcessStatus::Normal;
+        };
+        let (left, right): (&mut [f32], &mut [f32]) = (left, right);
+
+        self.process_eq(left, right);
+        self.process_output_gain(left, right);
+
+        // Lock-free, allocation-free; drops samples if the GUI isn't draining.
+        if self.analyzer_tx.push_stereo(left, right) > 0 {
+            self.repaint.request_repaint();
         }
+
         ProcessStatus::Normal
     }
 }
