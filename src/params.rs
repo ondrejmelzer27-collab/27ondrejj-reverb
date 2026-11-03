@@ -287,6 +287,40 @@ mod tests {
         assert!(!p.eq_is_smoothing());
     }
 
+    /// The editor size and analyzer tilt are not parameters; they travel in the state's
+    /// persisted fields (keys are part of saved state, like param IDs).
+    #[test]
+    fn persisted_fields_round_trip() {
+        use std::sync::atomic::Ordering;
+
+        let saved = VocalEqParams::default();
+        saved.editor_width.store(1234.5, Ordering::Relaxed);
+        saved.editor_height.store(777.25, Ordering::Relaxed);
+        saved.analyzer_tilt.store(false, Ordering::Relaxed);
+        let fields = saved.serialize_fields();
+        let keys: Vec<&str> = fields.keys().map(String::as_str).collect();
+        assert_eq!(keys, ["analyzer-tilt", "editor-height", "editor-width"]);
+
+        let restored = VocalEqParams::default();
+        restored.deserialize_fields(&fields);
+        assert_eq!(restored.editor_width.load(Ordering::Relaxed), 1234.5);
+        assert_eq!(restored.editor_height.load(Ordering::Relaxed), 777.25);
+        assert!(!restored.analyzer_tilt.load(Ordering::Relaxed));
+        assert_eq!(restored.serialize_fields(), fields);
+
+        // An older state without some of the fields keeps those at their defaults.
+        let mut partial = fields.clone();
+        partial.remove("editor-width");
+        let fresh = VocalEqParams::default();
+        fresh.deserialize_fields(&partial);
+        assert_eq!(
+            fresh.editor_width.load(Ordering::Relaxed),
+            DEFAULT_EDITOR_SIZE.0
+        );
+        assert_eq!(fresh.editor_height.load(Ordering::Relaxed), 777.25);
+        assert!(!fresh.analyzer_tilt.load(Ordering::Relaxed));
+    }
+
     #[test]
     fn param_ids_are_unique_and_prefixed() {
         let p = VocalEqParams::default();
