@@ -143,9 +143,11 @@ in (stereo) ─► HPF ─► low shelf ─► mid peak ─► high shelf ─►
   default settings the buffers are not touched at all. When a band reaches 0 dB, its decaying
   tail runs out until it falls below 1e-12 (−240 dBFS) and is then dropped, so there is no
   step.
-- **Denormals:** filter state below 1e-20 is flushed to zero once per processed segment, so
-  silence never leaves subnormals behind. NaN or inf state is reset, so one bad input sample
-  cannot poison a filter.
+- **Denormals:** subnormal samples are zeroed at the plugin's input and output with an
+  integer bit test (no FTZ/DAZ flags, no `unsafe`), so the host never receives subnormals and
+  subnormal input doesn't hit the slow CPU path. Filter state below 1e-20 is flushed to zero
+  once per processed segment, so silence never leaves subnormals behind. NaN or inf state is
+  reset, so one bad input sample cannot poison a filter.
 - **Realtime safety:** `process()` has no allocations, locks, I/O or unbounded loops.
   - The analyzer transport is a lock-free SPSC [`rtrb`](https://crates.io/crates/rtrb) ring
     of 32768 samples, preallocated at construction. The audio thread drops samples when it is
